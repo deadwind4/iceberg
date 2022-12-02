@@ -23,6 +23,7 @@ import java.io.UncheckedIOException;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import javax.annotation.Nullable;
@@ -40,10 +41,13 @@ import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.util.Preconditions;
 import org.apache.iceberg.Schema;
+import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.log.LogStoreOffsetsUtils;
+import org.apache.iceberg.flink.log.LogStoreTableFactory;
 import org.apache.iceberg.flink.source.assigner.SplitAssigner;
 import org.apache.iceberg.flink.source.assigner.SplitAssignerFactory;
 import org.apache.iceberg.flink.source.enumerator.ContinuousIcebergEnumerator;
@@ -58,6 +62,7 @@ import org.apache.iceberg.flink.source.reader.ReaderFunction;
 import org.apache.iceberg.flink.source.reader.RowDataReaderFunction;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplit;
 import org.apache.iceberg.flink.source.split.IcebergSourceSplitSerializer;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.ThreadPools;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -75,17 +80,28 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
   // that can discover table changes
   private transient Table table;
 
+  private final boolean logStoreEnabled;
+  private final Map<Integer, Long> logStoreOffsets;
+
   IcebergSource(
       TableLoader tableLoader,
       ScanContext scanContext,
       ReaderFunction<T> readerFunction,
       SplitAssignerFactory assignerFactory,
-      Table table) {
+      Table table,
+      boolean logStoreEnabled,
+      Map<Integer, Long> logStoreOffsets) {
     this.tableLoader = tableLoader;
     this.scanContext = scanContext;
     this.readerFunction = readerFunction;
     this.assignerFactory = assignerFactory;
     this.table = table;
+    this.logStoreEnabled = logStoreEnabled;
+    this.logStoreOffsets = logStoreOffsets;
+  }
+
+  public Map<Integer, Long> getLogStoreOffsets() {
+    return logStoreOffsets;
   }
 
   String name() {
@@ -133,7 +149,9 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
 
   @Override
   public Boundedness getBoundedness() {
-    return scanContext.isStreaming() ? Boundedness.CONTINUOUS_UNBOUNDED : Boundedness.BOUNDED;
+    return scanContext.isStreaming() && !logStoreEnabled
+        ? Boundedness.CONTINUOUS_UNBOUNDED
+        : Boundedness.BOUNDED;
   }
 
   @Override
@@ -179,7 +197,7 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
       assigner = assignerFactory.createAssigner(enumState.pendingSplits());
     }
 
-    if (scanContext.isStreaming()) {
+    if (scanContext.isStreaming() && !logStoreEnabled) {
       ContinuousSplitPlanner splitPlanner =
           new ContinuousSplitPlannerImpl(lazyTable(), scanContext, planningThreadName());
       return new ContinuousIcebergEnumerator(
@@ -212,6 +230,8 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
     private final ScanContext.Builder contextBuilder = ScanContext.builder();
     private TableSchema projectedFlinkSchema;
     private Boolean exposeLocality;
+
+    private boolean logStoreEnabled;
 
     Builder() {}
 
@@ -335,6 +355,11 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
       return this;
     }
 
+    public Builder<T> logStoreEnabled(boolean newLogStoreEnabled) {
+      this.logStoreEnabled = newLogStoreEnabled;
+      return this;
+    }
+
     public Builder<T> properties(Map<String, String> properties) {
       contextBuilder.fromProperties(properties);
       return this;
@@ -368,10 +393,29 @@ public class IcebergSource<T> implements Source<T, IcebergSourceSplit, IcebergEn
         this.readerFunction = (ReaderFunction<T>) rowDataReaderFunction;
       }
 
+      Map<Integer, Long> offsetsMap = Maps.newHashMap();
+      if (logStoreEnabled) {
+        Snapshot snapshot = table.currentSnapshot();
+        if (snapshot != null) {
+          long snapshotId = snapshot.snapshotId();
+          contextBuilder.useSnapshotId(snapshotId);
+          String kafkaOffsets =
+              Optional.ofNullable(snapshot.summary().get(LogStoreTableFactory.LOG_STORE_OFFSETS))
+                  .orElse("");
+          offsetsMap.putAll(LogStoreOffsetsUtils.stringToOffsets(kafkaOffsets));
+        }
+      }
+
       checkRequired();
       // Since builder already load the table, pass it to the source to avoid double loading
       return new IcebergSource<T>(
-          tableLoader, context, readerFunction, splitAssignerFactory, table);
+          tableLoader,
+          context,
+          readerFunction,
+          splitAssignerFactory,
+          table,
+          logStoreEnabled,
+          offsetsMap);
     }
 
     private void checkRequired() {

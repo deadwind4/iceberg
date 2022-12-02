@@ -47,6 +47,8 @@ import org.apache.iceberg.Snapshot;
 import org.apache.iceberg.SnapshotUpdate;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.log.LogStoreOffsetsUtils;
+import org.apache.iceberg.flink.log.LogStoreTableFactory;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
@@ -305,14 +307,25 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
         summary.deleteFilesCount() == 0, "Cannot overwrite partitions with delete files.");
     // Commit the overwrite transaction.
     ReplacePartitions dynamicOverwrite = table.newReplacePartitions().scanManifestsWith(workerPool);
+
+    WriteResult.Builder builder = WriteResult.builder();
     for (WriteResult result : pendingResults.values()) {
       Preconditions.checkState(
           result.referencedDataFiles().length == 0, "Should have no referenced data files.");
       Arrays.stream(result.dataFiles()).forEach(dynamicOverwrite::addFile);
+      builder.add(result);
     }
 
+    String logStorePartitionOffsets =
+        LogStoreOffsetsUtils.offsetsToString(builder.build().logStorePartitionOffsets());
+    LOG.info("replacePartitions logStorePartitionOffsets: {}", logStorePartitionOffsets);
     commitOperation(
-        dynamicOverwrite, summary, "dynamic partition overwrite", newFlinkJobId, checkpointId);
+        dynamicOverwrite,
+        summary,
+        "dynamic partition overwrite",
+        newFlinkJobId,
+        checkpointId,
+        logStorePartitionOffsets);
   }
 
   private void commitDeltaTxn(
@@ -323,13 +336,21 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
     if (summary.deleteFilesCount() == 0) {
       // To be compatible with iceberg format V1.
       AppendFiles appendFiles = table.newAppend().scanManifestsWith(workerPool);
+
+      WriteResult.Builder builder = WriteResult.builder();
       for (WriteResult result : pendingResults.values()) {
         Preconditions.checkState(
             result.referencedDataFiles().length == 0,
             "Should have no referenced data files for append.");
         Arrays.stream(result.dataFiles()).forEach(appendFiles::appendFile);
+        builder.add(result);
       }
-      commitOperation(appendFiles, summary, "append", newFlinkJobId, checkpointId);
+
+      String logStorePartitionOffsets =
+          LogStoreOffsetsUtils.offsetsToString(builder.build().logStorePartitionOffsets());
+      LOG.info("commitDeltaTxn no deletes logStorePartitionOffsets: {}", logStorePartitionOffsets);
+      commitOperation(
+          appendFiles, summary, "append", newFlinkJobId, checkpointId, logStorePartitionOffsets);
     } else {
       // To be compatible with iceberg format V2.
       for (Map.Entry<Long, WriteResult> e : pendingResults.entrySet()) {
@@ -350,7 +371,12 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
 
         Arrays.stream(result.dataFiles()).forEach(rowDelta::addRows);
         Arrays.stream(result.deleteFiles()).forEach(rowDelta::addDeletes);
-        commitOperation(rowDelta, summary, "rowDelta", newFlinkJobId, e.getKey());
+        String logStorePartitionOffsets =
+            LogStoreOffsetsUtils.offsetsToString(result.logStorePartitionOffsets());
+        LOG.info(
+            "commitDeltaTxn has deletes logStorePartitionOffsets: {}", logStorePartitionOffsets);
+        commitOperation(
+            rowDelta, summary, "rowDelta", newFlinkJobId, e.getKey(), logStorePartitionOffsets);
       }
     }
   }
@@ -360,13 +386,15 @@ class IcebergFilesCommitter extends AbstractStreamOperator<Void>
       CommitSummary summary,
       String description,
       String newFlinkJobId,
-      long checkpointId) {
+      long checkpointId,
+      String logStoreOffsets) {
     LOG.info("Committing {} to table {} with summary: {}", description, table.name(), summary);
     snapshotProperties.forEach(operation::set);
     // custom snapshot metadata properties will be overridden if they conflict with internal ones
     // used by the sink.
     operation.set(MAX_COMMITTED_CHECKPOINT_ID, Long.toString(checkpointId));
     operation.set(FLINK_JOB_ID, newFlinkJobId);
+    operation.set(LogStoreTableFactory.LOG_STORE_OFFSETS, logStoreOffsets);
 
     long startNano = System.nanoTime();
     operation.commit(); // abort is automatically called if this fails.

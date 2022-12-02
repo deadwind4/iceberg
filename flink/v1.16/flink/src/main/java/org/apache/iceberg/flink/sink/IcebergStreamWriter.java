@@ -20,11 +20,25 @@ package org.apache.iceberg.flink.sink;
 
 import java.io.IOException;
 import java.util.concurrent.TimeUnit;
+import javax.annotation.Nullable;
+import org.apache.flink.api.common.functions.util.FunctionUtils;
+import org.apache.flink.api.common.state.CheckpointListener;
+import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.state.StateInitializationContext;
+import org.apache.flink.runtime.state.StateSnapshotContext;
+import org.apache.flink.streaming.api.functions.sink.SinkFunction;
+import org.apache.flink.streaming.api.graph.StreamConfig;
 import org.apache.flink.streaming.api.operators.AbstractStreamOperator;
 import org.apache.flink.streaming.api.operators.BoundedOneInput;
 import org.apache.flink.streaming.api.operators.ChainingStrategy;
 import org.apache.flink.streaming.api.operators.OneInputStreamOperator;
+import org.apache.flink.streaming.api.operators.Output;
 import org.apache.flink.streaming.runtime.streamrecord.StreamRecord;
+import org.apache.flink.streaming.runtime.tasks.ProcessingTimeService;
+import org.apache.flink.streaming.runtime.tasks.StreamTask;
+import org.apache.flink.streaming.util.functions.StreamingFunctionUtils;
+import org.apache.iceberg.flink.log.LogSinkFunction;
+import org.apache.iceberg.flink.log.LogWriteCallback;
 import org.apache.iceberg.io.TaskWriter;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.base.MoreObjects;
@@ -42,14 +56,43 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
   private transient int attemptId;
   private transient IcebergStreamWriterMetrics writerMetrics;
 
-  IcebergStreamWriter(String fullTableName, TaskWriterFactory<T> taskWriterFactory) {
+  private LogSinkFunction logSinkFunction;
+  @Nullable private transient LogWriteCallback logCallback;
+  private transient SimpleContext sinkContext;
+  private long currentWatermark = Long.MIN_VALUE;
+
+  IcebergStreamWriter(
+      String fullTableName,
+      TaskWriterFactory<T> taskWriterFactory,
+      LogSinkFunction logSinkFunction) {
     this.fullTableName = fullTableName;
     this.taskWriterFactory = taskWriterFactory;
+    this.logSinkFunction = logSinkFunction;
     setChainingStrategy(ChainingStrategy.ALWAYS);
   }
 
   @Override
-  public void open() {
+  public void setup(
+      StreamTask<?, ?> containingTask,
+      StreamConfig config,
+      Output<StreamRecord<WriteResult>> output) {
+    super.setup(containingTask, config, output);
+    if (logSinkFunction != null) {
+      FunctionUtils.setFunctionRuntimeContext(logSinkFunction, getRuntimeContext());
+    }
+  }
+
+  @Override
+  public void initializeState(StateInitializationContext context) throws Exception {
+    super.initializeState(context);
+
+    if (logSinkFunction != null) {
+      StreamingFunctionUtils.restoreFunctionState(context, logSinkFunction);
+    }
+  }
+
+  @Override
+  public void open() throws Exception {
     this.subTaskId = getRuntimeContext().getIndexOfThisSubtask();
     this.attemptId = getRuntimeContext().getAttemptNumber();
     this.writerMetrics = new IcebergStreamWriterMetrics(super.metrics, fullTableName);
@@ -59,6 +102,13 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
 
     // Initialize the task writer.
     this.writer = taskWriterFactory.create();
+
+    this.sinkContext = new SimpleContext(getProcessingTimeService());
+    if (logSinkFunction != null) {
+      FunctionUtils.openFunction(logSinkFunction, new Configuration());
+      logCallback = new LogWriteCallback();
+      logSinkFunction.setWriteCallback(logCallback);
+    }
   }
 
   @Override
@@ -70,6 +120,26 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
   @Override
   public void processElement(StreamRecord<T> element) throws Exception {
     writer.write(element.getValue());
+    if (logSinkFunction != null) {
+      logSinkFunction.invoke(element.getValue(), sinkContext);
+    }
+  }
+
+  @Override
+  public void snapshotState(StateSnapshotContext context) throws Exception {
+    super.snapshotState(context);
+    if (logSinkFunction != null) {
+      StreamingFunctionUtils.snapshotFunctionState(
+          context, getOperatorStateBackend(), logSinkFunction);
+    }
+  }
+
+  @Override
+  public void finish() throws Exception {
+    super.finish();
+    if (logSinkFunction != null) {
+      logSinkFunction.finish();
+    }
   }
 
   @Override
@@ -78,6 +148,25 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
     if (writer != null) {
       writer.close();
       writer = null;
+    }
+    if (logSinkFunction != null) {
+      FunctionUtils.closeFunction(logSinkFunction);
+    }
+  }
+
+  @Override
+  public void notifyCheckpointComplete(long checkpointId) throws Exception {
+    super.notifyCheckpointComplete(checkpointId);
+    if (logSinkFunction instanceof CheckpointListener) {
+      ((CheckpointListener) logSinkFunction).notifyCheckpointComplete(checkpointId);
+    }
+  }
+
+  @Override
+  public void notifyCheckpointAborted(long checkpointId) throws Exception {
+    super.notifyCheckpointAborted(checkpointId);
+    if (logSinkFunction instanceof CheckpointListener) {
+      ((CheckpointListener) logSinkFunction).notifyCheckpointAborted(checkpointId);
     }
   }
 
@@ -109,6 +198,9 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
 
     long startNano = System.nanoTime();
     WriteResult result = writer.complete();
+    if (logCallback != null) {
+      result.setLogStorePartitionOffsets(logCallback.offsets());
+    }
     writerMetrics.updateFlushResult(result);
     output.collect(new StreamRecord<>(result));
     writerMetrics.flushDuration(TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startNano));
@@ -116,5 +208,31 @@ class IcebergStreamWriter<T> extends AbstractStreamOperator<WriteResult>
     // Set writer to null to prevent duplicate flushes in the corner case of
     // prepareSnapshotPreBarrier happening after endInput.
     writer = null;
+  }
+
+  private class SimpleContext implements SinkFunction.Context {
+
+    @Nullable private Long timestamp;
+
+    private final ProcessingTimeService processingTimeService;
+
+    SimpleContext(ProcessingTimeService processingTimeService) {
+      this.processingTimeService = processingTimeService;
+    }
+
+    @Override
+    public long currentProcessingTime() {
+      return processingTimeService.getCurrentProcessingTime();
+    }
+
+    @Override
+    public long currentWatermark() {
+      return currentWatermark;
+    }
+
+    @Override
+    public Long timestamp() {
+      return timestamp;
+    }
   }
 }

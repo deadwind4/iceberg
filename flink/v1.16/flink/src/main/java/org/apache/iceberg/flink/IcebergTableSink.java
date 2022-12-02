@@ -32,8 +32,11 @@ import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.sink.abilities.SupportsOverwrite;
 import org.apache.flink.table.connector.sink.abilities.SupportsPartitioning;
 import org.apache.flink.table.data.RowData;
+import org.apache.flink.table.factories.DynamicTableFactory;
 import org.apache.flink.types.RowKind;
 import org.apache.flink.util.Preconditions;
+import org.apache.iceberg.flink.log.LogSinkProvider;
+import org.apache.iceberg.flink.log.LogStoreTableFactory;
 import org.apache.iceberg.flink.sink.FlinkSink;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
 
@@ -45,48 +48,77 @@ public class IcebergTableSink implements DynamicTableSink, SupportsPartitioning,
 
   private boolean overwrite = false;
 
+  private final LogStoreTableFactory logStoreTableFactory;
+
+  private final DynamicTableFactory.Context context;
+
   private IcebergTableSink(IcebergTableSink toCopy) {
     this.tableLoader = toCopy.tableLoader;
     this.tableSchema = toCopy.tableSchema;
     this.overwrite = toCopy.overwrite;
     this.readableConfig = toCopy.readableConfig;
     this.writeProps = toCopy.writeProps;
+    this.logStoreTableFactory = toCopy.logStoreTableFactory;
+    this.context = toCopy.context;
   }
 
   public IcebergTableSink(
       TableLoader tableLoader,
       TableSchema tableSchema,
       ReadableConfig readableConfig,
-      Map<String, String> writeProps) {
+      Map<String, String> writeProps,
+      LogStoreTableFactory logStoreTableFactory,
+      DynamicTableFactory.Context context) {
     this.tableLoader = tableLoader;
     this.tableSchema = tableSchema;
     this.readableConfig = readableConfig;
     this.writeProps = writeProps;
+    this.logStoreTableFactory = logStoreTableFactory;
+    this.context = context;
   }
 
   @Override
-  public SinkRuntimeProvider getSinkRuntimeProvider(Context context) {
+  public SinkRuntimeProvider getSinkRuntimeProvider(Context sinkContext) {
     Preconditions.checkState(
-        !overwrite || context.isBounded(),
+        !overwrite || sinkContext.isBounded(),
         "Unbounded data stream doesn't support overwrite operation.");
-
     List<String> equalityColumns =
         tableSchema.getPrimaryKey().map(UniqueConstraint::getColumns).orElseGet(ImmutableList::of);
 
-    return new DataStreamSinkProvider() {
-      @Override
-      public DataStreamSink<?> consumeDataStream(
-          ProviderContext providerContext, DataStream<RowData> dataStream) {
-        return FlinkSink.forRowData(dataStream)
-            .tableLoader(tableLoader)
-            .tableSchema(tableSchema)
-            .equalityFieldColumns(equalityColumns)
-            .overwrite(overwrite)
-            .setAll(writeProps)
-            .flinkConf(readableConfig)
-            .append();
-      }
-    };
+    if (logStoreTableFactory != null) {
+      LogSinkProvider logSinkProvider =
+          logStoreTableFactory.createSinkProvider(this.context, sinkContext);
+      return new DataStreamSinkProvider() {
+        @Override
+        public DataStreamSink<?> consumeDataStream(
+            ProviderContext providerContext, DataStream<RowData> dataStream) {
+          return FlinkSink.forRowData(dataStream)
+              .tableLoader(tableLoader)
+              .tableSchema(tableSchema)
+              .equalityFieldColumns(equalityColumns)
+              .overwrite(overwrite)
+              .setAll(writeProps)
+              .flinkConf(readableConfig)
+              .logSinkProvider(logSinkProvider)
+              .append();
+        }
+      };
+    } else {
+      return new DataStreamSinkProvider() {
+        @Override
+        public DataStreamSink<?> consumeDataStream(
+            ProviderContext providerContext, DataStream<RowData> dataStream) {
+          return FlinkSink.forRowData(dataStream)
+              .tableLoader(tableLoader)
+              .tableSchema(tableSchema)
+              .equalityFieldColumns(equalityColumns)
+              .overwrite(overwrite)
+              .setAll(writeProps)
+              .flinkConf(readableConfig)
+              .append();
+        }
+      };
+    }
   }
 
   @Override

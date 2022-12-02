@@ -59,6 +59,7 @@ import org.apache.iceberg.flink.FlinkSchemaUtil;
 import org.apache.iceberg.flink.FlinkWriteConf;
 import org.apache.iceberg.flink.FlinkWriteOptions;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.log.LogSinkProvider;
 import org.apache.iceberg.flink.util.FlinkCompatibilityUtil;
 import org.apache.iceberg.io.WriteResult;
 import org.apache.iceberg.relocated.com.google.common.annotations.VisibleForTesting;
@@ -139,6 +140,7 @@ public class FlinkSink {
     private ReadableConfig readableConfig = new Configuration();
     private final Map<String, String> writeOptions = Maps.newHashMap();
     private FlinkWriteConf flinkWriteConf = null;
+    private LogSinkProvider logSinkProvider;
 
     private Builder() {}
 
@@ -316,6 +318,11 @@ public class FlinkSink {
       return this;
     }
 
+    public Builder logSinkProvider(LogSinkProvider newLogSinkProvider) {
+      this.logSinkProvider = newLogSinkProvider;
+      return this;
+    }
+
     private <T> DataStreamSink<T> chainIcebergOperators() {
       Preconditions.checkArgument(
           inputCreator != null,
@@ -456,7 +463,8 @@ public class FlinkSink {
       }
 
       IcebergStreamWriter<RowData> streamWriter =
-          createStreamWriter(table, flinkWriteConf, flinkRowType, equalityFieldIds);
+          createStreamWriter(
+              table, flinkWriteConf, flinkRowType, equalityFieldIds, logSinkProvider);
 
       int parallelism = writeParallelism == null ? input.getParallelism() : writeParallelism;
       SingleOutputStreamOperator<WriteResult> writerStream =
@@ -567,7 +575,8 @@ public class FlinkSink {
       Table table,
       FlinkWriteConf flinkWriteConf,
       RowType flinkRowType,
-      List<Integer> equalityFieldIds) {
+      List<Integer> equalityFieldIds,
+      LogSinkProvider logSinkProvider) {
     Preconditions.checkArgument(table != null, "Iceberg table shouldn't be null");
 
     Table serializableTable = SerializableTable.copyOf(table);
@@ -581,7 +590,15 @@ public class FlinkSink {
             writeProperties(table, format, flinkWriteConf),
             equalityFieldIds,
             flinkWriteConf.upsertMode());
-    return new IcebergStreamWriter<>(table.name(), taskWriterFactory);
+    if (logSinkProvider == null) {
+      return new IcebergStreamWriter<>(table.name(), taskWriterFactory, null);
+    } else {
+      return new IcebergStreamWriter<>(
+          table.name(),
+          taskWriterFactory,
+          logSinkProvider.createSink(
+              table, flinkRowType, equalityFieldIds, flinkWriteConf.upsertMode()));
+    }
   }
 
   /**

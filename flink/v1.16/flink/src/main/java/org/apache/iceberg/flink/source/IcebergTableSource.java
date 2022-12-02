@@ -25,7 +25,9 @@ import java.util.Optional;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
+import org.apache.flink.api.connector.source.Source;
 import org.apache.flink.configuration.ReadableConfig;
+import org.apache.flink.connector.base.source.hybrid.HybridSource;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -40,11 +42,14 @@ import org.apache.flink.table.connector.source.abilities.SupportsLimitPushDown;
 import org.apache.flink.table.connector.source.abilities.SupportsProjectionPushDown;
 import org.apache.flink.table.data.RowData;
 import org.apache.flink.table.expressions.ResolvedExpression;
+import org.apache.flink.table.factories.DynamicTableFactory;
 import org.apache.flink.table.types.DataType;
 import org.apache.iceberg.expressions.Expression;
 import org.apache.iceberg.flink.FlinkConfigOptions;
 import org.apache.iceberg.flink.FlinkFilters;
 import org.apache.iceberg.flink.TableLoader;
+import org.apache.iceberg.flink.log.LogSourceProvider;
+import org.apache.iceberg.flink.log.LogStoreTableFactory;
 import org.apache.iceberg.flink.source.assigner.SplitAssignerType;
 import org.apache.iceberg.relocated.com.google.common.base.Preconditions;
 import org.apache.iceberg.relocated.com.google.common.collect.ImmutableList;
@@ -68,6 +73,10 @@ public class IcebergTableSource
   private final boolean isLimitPushDown;
   private final ReadableConfig readableConfig;
 
+  private final LogStoreTableFactory logStoreTableFactory;
+
+  private final DynamicTableFactory.Context context;
+
   private IcebergTableSource(IcebergTableSource toCopy) {
     this.loader = toCopy.loader;
     this.schema = toCopy.schema;
@@ -77,14 +86,28 @@ public class IcebergTableSource
     this.limit = toCopy.limit;
     this.filters = toCopy.filters;
     this.readableConfig = toCopy.readableConfig;
+    this.logStoreTableFactory = toCopy.logStoreTableFactory;
+    this.context = toCopy.context;
   }
 
   public IcebergTableSource(
       TableLoader loader,
       TableSchema schema,
       Map<String, String> properties,
-      ReadableConfig readableConfig) {
-    this(loader, schema, properties, null, false, -1, ImmutableList.of(), readableConfig);
+      ReadableConfig readableConfig,
+      LogStoreTableFactory logStoreTableFactory,
+      DynamicTableFactory.Context context) {
+    this(
+        loader,
+        schema,
+        properties,
+        null,
+        false,
+        -1,
+        ImmutableList.of(),
+        readableConfig,
+        logStoreTableFactory,
+        context);
   }
 
   private IcebergTableSource(
@@ -95,7 +118,9 @@ public class IcebergTableSource
       boolean isLimitPushDown,
       long limit,
       List<Expression> filters,
-      ReadableConfig readableConfig) {
+      ReadableConfig readableConfig,
+      LogStoreTableFactory logStoreTableFactory,
+      DynamicTableFactory.Context context) {
     this.loader = loader;
     this.schema = schema;
     this.properties = properties;
@@ -104,6 +129,8 @@ public class IcebergTableSource
     this.limit = limit;
     this.filters = filters;
     this.readableConfig = readableConfig;
+    this.logStoreTableFactory = logStoreTableFactory;
+    this.context = context;
   }
 
   @Override
@@ -128,24 +155,48 @@ public class IcebergTableSource
         .build();
   }
 
-  private DataStreamSource<RowData> createFLIP27Stream(StreamExecutionEnvironment env) {
+  private DataStreamSource<RowData> createFLIP27Stream(
+      StreamExecutionEnvironment env, ScanContext scanContext) {
     SplitAssignerType assignerType =
         readableConfig.get(FlinkConfigOptions.TABLE_EXEC_SPLIT_ASSIGNER_TYPE);
-    IcebergSource<RowData> source =
-        IcebergSource.forRowData()
-            .tableLoader(loader)
-            .assignerFactory(assignerType.factory())
-            .properties(properties)
-            .project(getProjectedSchema())
-            .limit(limit)
-            .filters(filters)
-            .flinkConfig(readableConfig)
-            .build();
+
+    LogSourceProvider logSourceProvider;
+    Source finalSource;
+    IcebergSource<RowData> fileSource;
+    if (logStoreTableFactory == null) {
+      fileSource =
+          IcebergSource.forRowData()
+              .tableLoader(loader)
+              .assignerFactory(assignerType.factory())
+              .properties(properties)
+              .project(getProjectedSchema())
+              .limit(limit)
+              .filters(filters)
+              .flinkConfig(readableConfig)
+              .build();
+      finalSource = fileSource;
+    } else {
+      logSourceProvider = logStoreTableFactory.createSourceProvider(this.context, scanContext);
+      fileSource =
+          IcebergSource.forRowData()
+              .tableLoader(loader)
+              .assignerFactory(assignerType.factory())
+              .properties(properties)
+              .project(getProjectedSchema())
+              .limit(limit)
+              .filters(filters)
+              .flinkConfig(readableConfig)
+              .logStoreEnabled(true)
+              .build();
+      Source logSource = logSourceProvider.createSource(fileSource.getLogStoreOffsets(), loader);
+      finalSource = HybridSource.builder(fileSource).addSource(logSource).build();
+    }
+
     DataStreamSource stream =
         env.fromSource(
-            source,
+            finalSource,
             WatermarkStrategy.noWatermarks(),
-            source.name(),
+            fileSource.name(),
             TypeInformation.of(RowData.class));
     return stream;
   }
@@ -204,7 +255,7 @@ public class IcebergTableSource
       public DataStream<RowData> produceDataStream(
           ProviderContext providerContext, StreamExecutionEnvironment execEnv) {
         if (readableConfig.get(FlinkConfigOptions.TABLE_EXEC_ICEBERG_USE_FLIP27_SOURCE)) {
-          return createFLIP27Stream(execEnv);
+          return createFLIP27Stream(execEnv, runtimeProviderContext);
         } else {
           return createDataStream(execEnv);
         }

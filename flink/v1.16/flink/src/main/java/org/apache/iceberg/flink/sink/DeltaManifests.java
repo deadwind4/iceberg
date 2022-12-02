@@ -30,18 +30,23 @@ class DeltaManifests {
   private final ManifestFile dataManifest;
   private final ManifestFile deleteManifest;
   private final CharSequence[] referencedDataFiles;
+  private final String logStoreOffsets;
 
   DeltaManifests(ManifestFile dataManifest, ManifestFile deleteManifest) {
-    this(dataManifest, deleteManifest, EMPTY_REF_DATA_FILES);
+    this(dataManifest, deleteManifest, EMPTY_REF_DATA_FILES, "");
   }
 
   DeltaManifests(
-      ManifestFile dataManifest, ManifestFile deleteManifest, CharSequence[] referencedDataFiles) {
+      ManifestFile dataManifest,
+      ManifestFile deleteManifest,
+      CharSequence[] referencedDataFiles,
+      String logStoreOffsets) {
     Preconditions.checkNotNull(referencedDataFiles, "Referenced data files shouldn't be null.");
 
     this.dataManifest = dataManifest;
     this.deleteManifest = deleteManifest;
     this.referencedDataFiles = referencedDataFiles;
+    this.logStoreOffsets = logStoreOffsets;
   }
 
   ManifestFile dataManifest() {
@@ -54,6 +59,10 @@ class DeltaManifests {
 
   CharSequence[] referencedDataFiles() {
     return referencedDataFiles;
+  }
+
+  String logStoreOffsets() {
+    return logStoreOffsets;
   }
 
   List<ManifestFile> manifests() {

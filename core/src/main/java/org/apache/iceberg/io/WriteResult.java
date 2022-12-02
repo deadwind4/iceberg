@@ -21,10 +21,12 @@ package org.apache.iceberg.io;
 import java.io.Serializable;
 import java.util.Collections;
 import java.util.List;
+import java.util.Map;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
 import org.apache.iceberg.relocated.com.google.common.collect.Iterables;
 import org.apache.iceberg.relocated.com.google.common.collect.Lists;
+import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.util.CharSequenceSet;
 
 public class WriteResult implements Serializable {
@@ -32,11 +34,17 @@ public class WriteResult implements Serializable {
   private DeleteFile[] deleteFiles;
   private CharSequence[] referencedDataFiles;
 
+  private Map<Integer, Long> logStorePartitionOffsets;
+
   private WriteResult(
-      List<DataFile> dataFiles, List<DeleteFile> deleteFiles, CharSequenceSet referencedDataFiles) {
+      List<DataFile> dataFiles,
+      List<DeleteFile> deleteFiles,
+      CharSequenceSet referencedDataFiles,
+      Map<Integer, Long> logStorePartitionOffsets) {
     this.dataFiles = dataFiles.toArray(new DataFile[0]);
     this.deleteFiles = deleteFiles.toArray(new DeleteFile[0]);
     this.referencedDataFiles = referencedDataFiles.toArray(new CharSequence[0]);
+    this.logStorePartitionOffsets = logStorePartitionOffsets;
   }
 
   public DataFile[] dataFiles() {
@@ -51,6 +59,14 @@ public class WriteResult implements Serializable {
     return referencedDataFiles;
   }
 
+  public Map<Integer, Long> logStorePartitionOffsets() {
+    return logStorePartitionOffsets;
+  }
+
+  public void setLogStorePartitionOffsets(Map<Integer, Long> logStorePartitionOffsets) {
+    this.logStorePartitionOffsets = logStorePartitionOffsets;
+  }
+
   public static Builder builder() {
     return new Builder();
   }
@@ -59,18 +75,20 @@ public class WriteResult implements Serializable {
     private final List<DataFile> dataFiles;
     private final List<DeleteFile> deleteFiles;
     private final CharSequenceSet referencedDataFiles;
+    private Map<Integer, Long> logStorePartitionOffsets;
 
     private Builder() {
       this.dataFiles = Lists.newArrayList();
       this.deleteFiles = Lists.newArrayList();
       this.referencedDataFiles = CharSequenceSet.empty();
+      this.logStorePartitionOffsets = Maps.newHashMap();
     }
 
     public Builder add(WriteResult result) {
       addDataFiles(result.dataFiles);
       addDeleteFiles(result.deleteFiles);
       addReferencedDataFiles(result.referencedDataFiles);
-
+      addOffsets(result.logStorePartitionOffsets);
       return this;
     }
 
@@ -109,8 +127,19 @@ public class WriteResult implements Serializable {
       return this;
     }
 
+    public Builder addOffsets(Map<Integer, Long> newLogStorePartitionOffsets) {
+      for (Map.Entry<Integer, Long> entry : newLogStorePartitionOffsets.entrySet()) {
+        Long oldOffset = this.logStorePartitionOffsets.get(entry.getKey());
+        Long newOffset = entry.getValue();
+        if (oldOffset == null || oldOffset < newOffset) {
+          this.logStorePartitionOffsets.put(entry.getKey(), newOffset);
+        }
+      }
+      return this;
+    }
+
     public WriteResult build() {
-      return new WriteResult(dataFiles, deleteFiles, referencedDataFiles);
+      return new WriteResult(dataFiles, deleteFiles, referencedDataFiles, logStorePartitionOffsets);
     }
   }
 }

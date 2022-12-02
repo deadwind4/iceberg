@@ -20,6 +20,7 @@ package org.apache.iceberg.flink.sink;
 
 import java.io.IOException;
 import java.util.List;
+import java.util.Map;
 import java.util.function.Supplier;
 import org.apache.iceberg.DataFile;
 import org.apache.iceberg.DeleteFile;
@@ -30,6 +31,7 @@ import org.apache.iceberg.ManifestWriter;
 import org.apache.iceberg.PartitionSpec;
 import org.apache.iceberg.Table;
 import org.apache.iceberg.TableOperations;
+import org.apache.iceberg.flink.log.LogStoreOffsetsUtils;
 import org.apache.iceberg.io.CloseableIterable;
 import org.apache.iceberg.io.FileIO;
 import org.apache.iceberg.io.OutputFile;
@@ -101,7 +103,9 @@ class FlinkManifestUtil {
       deleteManifest = deleteManifestWriter.toManifestFile();
     }
 
-    return new DeltaManifests(dataManifest, deleteManifest, result.referencedDataFiles());
+    String kafkaOffsets = LogStoreOffsetsUtils.offsetsToString(result.logStorePartitionOffsets());
+    return new DeltaManifests(
+        dataManifest, deleteManifest, result.referencedDataFiles(), kafkaOffsets);
   }
 
   static WriteResult readCompletedFiles(DeltaManifests deltaManifests, FileIO io)
@@ -121,6 +125,9 @@ class FlinkManifestUtil {
       }
     }
 
+    Map<Integer, Long> offsets =
+        LogStoreOffsetsUtils.stringToOffsets(deltaManifests.logStoreOffsets());
+    builder.addOffsets(offsets);
     return builder.addReferencedDataFiles(deltaManifests.referencedDataFiles()).build();
   }
 }

@@ -41,6 +41,7 @@ project(":iceberg-flink:iceberg-flink-${flinkMajorVersion}") {
     compileOnly "org.apache.flink:flink-table-planner_${scalaVersion}:${flinkVersion}"
     compileOnly "org.apache.flink:flink-connector-base:${flinkVersion}"
     compileOnly "org.apache.flink:flink-connector-files:${flinkVersion}"
+    compileOnly "org.apache.flink:flink-connector-kafka:${flinkVersion}"
     compileOnly "org.apache.hadoop:hadoop-hdfs"
     compileOnly "org.apache.hadoop:hadoop-common"
     compileOnly("org.apache.hadoop:hadoop-minicluster") {
@@ -79,6 +80,14 @@ project(":iceberg-flink:iceberg-flink-${flinkMajorVersion}") {
     testImplementation project(path: ':iceberg-api', configuration: 'testArtifacts')
     testImplementation project(path: ':iceberg-core', configuration: 'testArtifacts')
     testImplementation project(path: ':iceberg-data', configuration: 'testArtifacts')
+
+    testImplementation("org.apache.kafka:kafka_${scalaVersion}:2.8.1") {
+      exclude group: 'org.slf4j', module: 'slf4j-log4j12'
+      exclude group: 'com.fasterxml.jackson.core'
+      exclude group: 'com.fasterxml.jackson.dataformat'
+      exclude group: 'com.fasterxml.jackson.module'
+      exclude group: 'com.fasterxml.jackson.datatype'
+    }
 
     // By default, hive-exec is a fat/uber jar and it exports a guava library
     // that's really old. We use the core classifier to be able to override our guava

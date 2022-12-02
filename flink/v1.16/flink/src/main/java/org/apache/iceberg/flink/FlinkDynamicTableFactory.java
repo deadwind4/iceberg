@@ -23,6 +23,8 @@ import java.util.Set;
 import org.apache.flink.configuration.ConfigOption;
 import org.apache.flink.configuration.ConfigOptions;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.configuration.description.Description;
+import org.apache.flink.configuration.description.TextElement;
 import org.apache.flink.table.api.TableSchema;
 import org.apache.flink.table.catalog.CatalogBaseTable;
 import org.apache.flink.table.catalog.CatalogDatabaseImpl;
@@ -35,10 +37,12 @@ import org.apache.flink.table.connector.sink.DynamicTableSink;
 import org.apache.flink.table.connector.source.DynamicTableSource;
 import org.apache.flink.table.factories.DynamicTableSinkFactory;
 import org.apache.flink.table.factories.DynamicTableSourceFactory;
+import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.utils.TableSchemaUtils;
 import org.apache.flink.util.Preconditions;
 import org.apache.iceberg.catalog.TableIdentifier;
 import org.apache.iceberg.exceptions.AlreadyExistsException;
+import org.apache.iceberg.flink.log.LogStoreTableFactory;
 import org.apache.iceberg.flink.source.IcebergTableSource;
 import org.apache.iceberg.relocated.com.google.common.collect.Maps;
 import org.apache.iceberg.relocated.com.google.common.collect.Sets;
@@ -46,6 +50,8 @@ import org.apache.iceberg.relocated.com.google.common.collect.Sets;
 public class FlinkDynamicTableFactory
     implements DynamicTableSinkFactory, DynamicTableSourceFactory {
   static final String FACTORY_IDENTIFIER = "iceberg";
+
+  public static final String NONE = "none";
 
   private static final ConfigOption<String> CATALOG_NAME =
       ConfigOptions.key("catalog-name")
@@ -70,6 +76,27 @@ public class FlinkDynamicTableFactory
           .stringType()
           .noDefaultValue()
           .withDescription("Table name managed in the underlying iceberg catalog and database.");
+
+  public static final ConfigOption<String> LOG_STORE =
+      ConfigOptions.key("log-store")
+          .stringType()
+          .defaultValue(NONE)
+          .withDescription(
+              Description.builder()
+                  .text("The log system used to keep changes of the table.")
+                  .linebreak()
+                  .linebreak()
+                  .text("Possible values:")
+                  .linebreak()
+                  .list(
+                      TextElement.text(
+                          "\"none\": No log system, the data is written only to file store,"
+                              + " and the streaming read will be directly read from the file store."))
+                  .list(
+                      TextElement.text(
+                          "\"kafka\": Kafka log system, the data is double written to file"
+                              + " store and kafka, and the streaming read will be read from kafka."))
+                  .build());
 
   private final FlinkCatalog catalog;
 
@@ -100,7 +127,13 @@ public class FlinkDynamicTableFactory
               objectIdentifier.getObjectName());
     }
 
-    return new IcebergTableSource(tableLoader, tableSchema, tableProps, context.getConfiguration());
+    return new IcebergTableSource(
+        tableLoader,
+        tableSchema,
+        tableProps,
+        context.getConfiguration(),
+        createLogStoreFactory(context.getClassLoader(), tableProps),
+        null);
   }
 
   @Override
@@ -119,7 +152,13 @@ public class FlinkDynamicTableFactory
               catalogTable, writeProps, objectPath.getDatabaseName(), objectPath.getObjectName());
     }
 
-    return new IcebergTableSink(tableLoader, tableSchema, context.getConfiguration(), writeProps);
+    return new IcebergTableSink(
+        tableLoader,
+        tableSchema,
+        context.getConfiguration(),
+        writeProps,
+        createLogStoreFactory(context.getClassLoader(), writeProps),
+        context);
   }
 
   @Override
@@ -135,6 +174,7 @@ public class FlinkDynamicTableFactory
     Set<ConfigOption<?>> options = Sets.newHashSet();
     options.add(CATALOG_DATABASE);
     options.add(CATALOG_TABLE);
+    options.add(LOG_STORE);
     return options;
   }
 
@@ -203,4 +243,42 @@ public class FlinkDynamicTableFactory
     Preconditions.checkNotNull(catalog, "Flink catalog cannot be null");
     return TableLoader.fromCatalog(catalog.getCatalogLoader(), catalog.toIdentifier(objectPath));
   }
+
+  static LogStoreTableFactory createLogStoreFactory(
+      ClassLoader classLoader, Map<String, String> options) {
+    Configuration configOptions = new Configuration();
+    options.forEach(configOptions::setString);
+
+    if (configOptions.get(LOG_STORE).equalsIgnoreCase(NONE)) {
+      return null;
+    } else {
+      return FactoryUtil.discoverFactory(
+          classLoader, LogStoreTableFactory.class, configOptions.get(LOG_STORE));
+    }
+  }
+
+  //  private static Map<String, String> stripPrefix(Map<String, String> tableOptions, String
+  // prefix) {
+  //    Map<String, String> options = Maps.newHashMap();
+  //    tableOptions.keySet().stream()
+  //        .filter(key -> key.startsWith(prefix))
+  //        .forEach(
+  //            key -> {
+  //              final String value = tableOptions.get(key);
+  //              final String subKey = key.substring(prefix.length());
+  //              options.put(subKey, value);
+  //            });
+  //    return options;
+  //  }
+
+  //  private static Context newContext(Context context, Map<String, String> newOptions) {
+  //    return new FactoryUtil.DefaultDynamicTableContext(
+  //        context.getObjectIdentifier(),
+  //        context.getCatalogTable().copy(newOptions),
+  //        // TODO What options we should use
+  //        newOptions,
+  //        context.getConfiguration(),
+  //        context.getClassLoader(),
+  //        context.isTemporary());
+  //  }
 }
